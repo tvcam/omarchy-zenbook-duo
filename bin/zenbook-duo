@@ -260,15 +260,48 @@ cmd_arrange() {
   apply
 }
 
-# Make a just-selected window easy to spot: a thick border for a moment and its
-# app name in the on-screen display of the screen it is on.
+# Make a just-selected window "pop":
+#  - spotlight: every other window dims for a moment (Hyprland's fadeDim animation),
+#  - the border swells to 10px and settles back, flashing bright before easing
+#    back to the theme colour (Hyprland's border animation),
+#  - its title shows in the on-screen display of the screen it is on.
+# Rapid presses share one spotlight; only the last press restores the settings.
 highlight_window() {
-  local addr=$1 name
+  local addr=$1 name run="${XDG_RUNTIME_DIR:-/tmp}/zenbook-duo-pop" token
+  local win="address:$addr"
+  setprop() { hyprctl dispatch "hl.dsp.window.set_prop({ window = \"$win\", prop = \"$1\", value = \"$2\" })" >/dev/null; }
+
+  # Remember the user's dim settings once per spotlight.
+  if [[ ! -f $run.orig ]]; then
+    printf '%s %s\n' \
+      "$(hyprctl getoption decoration:dim_inactive -j | jq -r '.int // .bool // 0')" \
+      "$(hyprctl getoption decoration:dim_strength -j | jq -r '.float // 0.5')" >"$run.orig"
+  fi
+  token=$(date +%s%N)
+  echo "$token" >"$run.token"
+  hyprctl eval 'hl.config({ decoration = { dim_inactive = true, dim_strength = 0.45 } })' >/dev/null
+
   name=$(hyprctl clients -j | jq -r --arg a "$addr" '.[] | select(.address == $a) | (if (.title // "") != "" then .title else .class end) | .[0:40]')
-  hyprctl dispatch "hl.dsp.window.set_prop({ window = \"address:$addr\", prop = \"border_size\", value = \"8\" })" >/dev/null
-  [[ -n $name ]] && omarchy-osd -i window -m "$name" -d 800 >/dev/null 2>&1 &
-  # Restore after a moment; detached so key repeat stays responsive.
-  ( sleep 0.8; hyprctl dispatch "hl.dsp.window.set_prop({ window = \"address:$addr\", prop = \"border_size\", value = \"unset\" })" >/dev/null ) &
+  [[ -n $name ]] && { omarchy-osd -i window -m "$name" -d 900 >/dev/null 2>&1 & }
+
+  (
+    # Border pop: quick swell with a bright flash, then settle.
+    setprop active_border_color "rgb(ffffff)"
+    for b in 4 7 10; do setprop border_size "$b"; sleep 0.03; done
+    sleep 0.12
+    setprop active_border_color unset  # eases back to the theme colour
+    for b in 9 8 7 6 5 4 3; do setprop border_size "$b"; sleep 0.04; done
+    setprop border_size unset
+
+    # Lift the spotlight, unless a newer press took over.
+    sleep 0.25
+    if [[ $(cat "$run.token" 2>/dev/null) == "$token" && -f $run.orig ]]; then
+      read -r dim strength <"$run.orig"
+      [[ $dim == 1 || $dim == true ]] && dim=true || dim=false
+      hyprctl eval "hl.config({ decoration = { dim_inactive = $dim, dim_strength = $strength } })" >/dev/null
+      rm -f "$run.orig" "$run.token"
+    fi
+  ) >/dev/null 2>&1 &
   disown -a 2>/dev/null || true
 }
 
