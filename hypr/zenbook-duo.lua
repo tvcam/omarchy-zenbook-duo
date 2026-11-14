@@ -35,3 +35,8 @@ o.bind("XF86Launch3", "Zenbook Duo panel", "omarchy-shell zenbook-duo toggle")  
 o.bind("XF86Launch4", "Bottom screen on/off", duo .. " bottom toggle")                            -- key right of F12
 o.rebind("CTRL + XF86MonBrightnessUp", "Keyboard brightness up", duo .. " kbd-light up", { locked = true })
 o.rebind("CTRL + XF86MonBrightnessDown", "Keyboard brightness down", duo .. " kbd-light down", { locked = true })
+
+-- Alt+Tab cycles every visible window on every screen (Omarchy's default only
+-- cycles the current workspace, often a single window with two built-in screens).
+o.rebind("ALT + TAB", "Focus next window (all screens)", duo .. " cycle next")
+o.rebind("ALT + SHIFT + TAB", "Focus previous window (all screens)", duo .. " cycle prev")

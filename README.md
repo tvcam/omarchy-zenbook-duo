@@ -65,6 +65,7 @@ After that it reconnects on its own.
 | F11 | Emoji picker |
 | F12 (MyASUS) | Open the Zenbook Duo panel |
 | Key right of F12 | Bottom screen on/off |
+| Alt + Tab / Shift + Alt + Tab | Cycle every visible window across all screens (Omarchy's default only cycles the current workspace) |
 | Fn + Esc | Fn-lock: the top row sends F1–F12 instead of the functions above |
 
 To change what a key does, edit `~/.config/hypr/zenbook-duo.lua`. F8, F11, F12 and the key right of F12 arrive as `XF86Launch1`, `XF86Launch2`, `XF86Launch3` and `XF86Launch4`. The keyboard forgets its backlight level and Fn-lock state each time it docks or reconnects, so the service sends them again.
@@ -81,6 +82,7 @@ zenbook-duo layout stacked|side|top-only|next
 zenbook-duo external above|below|left|right        where external monitors go in the presets
 zenbook-duo arrange <monitor> <x> <y>              move a screen (logical px), saved per monitor
 zenbook-duo swap
+zenbook-duo cycle [next|prev]
 zenbook-duo kbd-light 0-3|up|down|cycle
 zenbook-duo keyboard pair|connect
 zenbook-duo apply | watch

@@ -10,6 +10,7 @@
 #   zenbook-duo external above|below|left|right        Where external monitors go in the presets
 #   zenbook-duo arrange <monitor> <x> <y>              Move a screen (logical px); saves a custom layout
 #   zenbook-duo keyboard pair|connect                  Pair (once) / connect the keyboard over Bluetooth
+#   zenbook-duo cycle [next|prev]                      Alt+Tab across all screens
 #   zenbook-duo swap                                   Swap workspaces between top and bottom screens
 #   zenbook-duo kbd-light 0-3|up|down|cycle            Keyboard backlight (needs zenbook-duo-keys service)
 #   zenbook-duo apply                                  Re-apply screen state now
@@ -399,6 +400,23 @@ case ${1:-} in
       *) die "usage: zenbook-duo keyboard connect|pair" ;;
     esac
     ;;
+  cycle)
+    # Alt+Tab across every visible window on every screen, in screen order
+    # (top-left first), then window position. Omarchy's default only cycles the
+    # current workspace, which on a multi-screen setup is often a single window.
+    dir=${2:-next}
+    next=$(jq -rn --argjson mons "$(hyprctl monitors -j)" --argjson cl "$(hyprctl clients -j)" \
+      --arg act "$(hyprctl activewindow -j | jq -r '.address // ""')" --arg dir "$dir" '
+      ($mons | map(.activeWorkspace.id) + map(.specialWorkspace.id | select(. != 0))) as $ws
+      | ($mons | map({ (.id | tostring): [.y, .x] }) | add) as $mpos
+      | [ $cl[] | select(.mapped and (.hidden | not) and (.workspace.id as $w | $ws | index($w))) ]
+      | sort_by($mpos[.monitor | tostring], .at[1], .at[0]) | map(.address) as $a
+      | if ($a | length) == 0 then empty else
+          (($a | index($act)) // -1) as $i
+          | $a[ (if $dir == "prev" then $i - 1 + ($a | length) else $i + 1 end) % ($a | length) ]
+        end')
+    [[ -n $next ]] && hyprctl dispatch "hl.dsp.focus({ window = \"address:$next\" })" >/dev/null
+    ;;
   swap) hyprctl dispatch "hl.dsp.workspace.swap_monitors({ monitor1 = \"$TOP\", monitor2 = \"$BOTTOM\" })" >/dev/null ;;
   kbd-light)
     case ${2:-cycle} in 0 | 1 | 2 | 3 | cycle | up | down) ;; *) die "kbd-light: 0-3, up, down or cycle" ;; esac
@@ -408,6 +426,6 @@ case ${1:-} in
   arrange) shift; cmd_arrange "${1:-}" "${2:-}" "${3:-}" ;;
   apply) apply ;;
   watch) cmd_watch ;;
-  -h | --help | help | "") sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h | --help | help | "") sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac
