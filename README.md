@@ -16,9 +16,15 @@ Tested on the **Zenbook Duo 2025 (UX8406CA)**: keyboard `0b05:1bf2` docked over 
 ## Install
 
 ```bash
-git clone <this repo> ~/omarchy-zenbook-duo
+git clone https://github.com/tvcam/omarchy-zenbook-duo ~/omarchy-zenbook-duo
 cd ~/omarchy-zenbook-duo
 ./install.sh --bluetooth      # drop --bluetooth to leave /etc/bluetooth/main.conf alone
+```
+
+Or install only the bar panel straight from Omarchy (then run `./install.sh` from `~/.config/omarchy/plugins/zenbook-duo` for the rest):
+
+```bash
+omarchy plugin add https://github.com/tvcam/omarchy-zenbook-duo
 ```
 
 `install.sh` does the following:
