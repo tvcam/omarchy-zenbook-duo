@@ -262,8 +262,8 @@ cmd_arrange() {
 
 # Make a just-selected window "pop":
 #  - spotlight: every other window dims for a moment (Hyprland's fadeDim animation),
-#  - the border swells to 10px and settles back, flashing bright before easing
-#    back to the theme colour (Hyprland's border animation),
+#  - the border gets a little thicker with a soft white glow that eases back to
+#    the theme colour (Hyprland's border animation),
 #  - its title shows in the on-screen display of the screen it is on.
 # Rapid presses share one spotlight; only the last press restores the settings.
 highlight_window() {
@@ -279,22 +279,23 @@ highlight_window() {
   fi
   token=$(date +%s%N)
   echo "$token" >"$run.token"
-  hyprctl eval 'hl.config({ decoration = { dim_inactive = true, dim_strength = 0.45 } })' >/dev/null
+  hyprctl eval 'hl.config({ decoration = { dim_inactive = true, dim_strength = 0.3 } })' >/dev/null
 
   name=$(hyprctl clients -j | jq -r --arg a "$addr" '.[] | select(.address == $a) | (if (.title // "") != "" then .title else .class end) | .[0:40]')
   [[ -n $name ]] && { omarchy-osd -i window -m "$name" -d 900 >/dev/null 2>&1 & }
 
   (
-    # Border pop: quick swell with a bright flash, then settle.
-    setprop active_border_color "rgb(ffffff)"
-    for b in 4 7 10; do setprop border_size "$b"; sleep 0.03; done
-    sleep 0.12
-    setprop active_border_color unset  # eases back to the theme colour
-    for b in 9 8 7 6 5 4 3; do setprop border_size "$b"; sleep 0.04; done
+    # Border pop: a touch thicker with a soft white glow. Hyprland's border
+    # animation (easeOutQuint) fades the colour smoothly back to the theme.
+    setprop border_size 4
+    setprop active_border_color "rgba(ffffffd9)"
+    sleep 0.18
+    setprop active_border_color unset
+    sleep 0.55
     setprop border_size unset
 
     # Lift the spotlight, unless a newer press took over.
-    sleep 0.25
+    sleep 0.1
     if [[ $(cat "$run.token" 2>/dev/null) == "$token" && -f $run.orig ]]; then
       read -r dim strength <"$run.orig"
       [[ $dim == 1 || $dim == true ]] && dim=true || dim=false

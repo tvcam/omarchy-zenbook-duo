@@ -36,6 +36,10 @@ o.bind("XF86Launch4", "Bottom screen on/off", duo .. " bottom toggle")          
 o.rebind("CTRL + XF86MonBrightnessUp", "Keyboard brightness up", duo .. " kbd-light up", { locked = true })
 o.rebind("CTRL + XF86MonBrightnessDown", "Keyboard brightness down", duo .. " kbd-light down", { locked = true })
 
+-- Smooth spotlight for the Alt+Tab highlight: Hyprland has no dim animation of
+-- its own and borrows the snappy "fade" one, so give it a gentle ease.
+hl.animation({ leaf = "fadeDim", enabled = true, speed = 4, bezier = "easeInOutCubic" })
+
 -- Alt+Tab cycles every visible window on every screen (Omarchy's default only
 -- cycles the current workspace, often a single window with two built-in screens).
 o.rebind("ALT + TAB", "Focus next window (all screens)", duo .. " cycle next")
