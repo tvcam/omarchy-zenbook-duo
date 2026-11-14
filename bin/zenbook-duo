@@ -1,0 +1,413 @@
+#!/bin/bash
+# zenbook-duo — dual-screen controls for the ASUS Zenbook Duo on Omarchy/Hyprland.
+#
+#   zenbook-duo state                                  Print JSON state (used by the bar panel)
+#   zenbook-duo brightness [--monitor M|--both] [--no-osd] [get|+N%|N%-|N%]
+#   zenbook-duo bottom on|off|toggle                   Bottom screen on/off
+#   zenbook-duo auto on|off|toggle                     Turn bottom screen off while keyboard is docked
+#   zenbook-duo link on|off|toggle                     Brightness keys/sliders move both screens together
+#   zenbook-duo layout stacked|side|top-only|next      Screen arrangement presets
+#   zenbook-duo external above|below|left|right        Where external monitors go in the presets
+#   zenbook-duo arrange <monitor> <x> <y>              Move a screen (logical px); saves a custom layout
+#   zenbook-duo keyboard pair|connect                  Pair (once) / connect the keyboard over Bluetooth
+#   zenbook-duo swap                                   Swap workspaces between top and bottom screens
+#   zenbook-duo kbd-light 0-3|up|down|cycle            Keyboard backlight (needs zenbook-duo-keys service)
+#   zenbook-duo apply                                  Re-apply screen state now
+#   zenbook-duo watch                                  Daemon: react to keyboard dock/undock
+
+set -u
+
+TOP="${ZENBOOK_DUO_TOP:-eDP-1}"
+BOTTOM="${ZENBOOK_DUO_BOTTOM:-eDP-2}"
+KB_NAME="Zenbook Duo Keyboard"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zenbook-duo"
+MONITORS_LUA="$STATE_DIR/monitors.lua"
+POSITIONS="$STATE_DIR/positions"
+mkdir -p "$STATE_DIR"
+
+die() { echo "zenbook-duo: $*" >&2; exit 1; }
+
+# ---------- settings ----------
+setting() { # setting <name> <default>
+  local v
+  v=$(cat "$STATE_DIR/$1" 2>/dev/null) || v=""
+  echo "${v:-$2}"
+}
+set_setting() { printf '%s\n' "$2" >"$STATE_DIR/$1"; }
+
+onoff() { # onoff <name> <default> <on|off|toggle>
+  local cur new
+  cur=$(setting "$1" "$2")
+  case $3 in
+    on | off) new=$3 ;;
+    toggle) [[ $cur == on ]] && new=off || new=on ;;
+    *) die "expected on, off or toggle" ;;
+  esac
+  set_setting "$1" "$new"
+}
+
+# ---------- keyboard ----------
+kb_docked() {
+  local d
+  for d in /sys/bus/usb/devices/*; do
+    [[ -f $d/idVendor && $(<"$d/idVendor") == 0b05 ]] || continue
+    [[ $(cat "$d/product" 2>/dev/null) == *"$KB_NAME"* ]] && return 0
+  done
+  return 1
+}
+
+kb_mac() { # paired keyboard's address
+  bluetoothctl devices Paired 2>/dev/null | grep -F "$KB_NAME" | awk '{print $2}' | head -1
+}
+
+kb_pair() {
+  local mac i
+  kb_docked && die "lift the keyboard off the screen first, then run this again"
+  echo "Scanning for the keyboard (60s)…"
+  bluetoothctl power on >/dev/null 2>&1
+  bluetoothctl --timeout 60 scan on >/dev/null 2>&1 &
+  for i in $(seq 1 60); do
+    mac=$(bluetoothctl devices 2>/dev/null | grep -F "$KB_NAME" | awk '{print $2}' | head -1)
+    if [[ -n $mac ]]; then
+      bluetoothctl pair "$mac" >/dev/null 2>&1
+      bluetoothctl trust "$mac" >/dev/null 2>&1
+      bluetoothctl connect "$mac" >/dev/null 2>&1
+      bluetoothctl info "$mac" | grep -E "Name|Paired|Trusted|Connected"
+      return 0
+    fi
+    sleep 1
+  done
+  die "keyboard not found; make sure its power switch is on"
+}
+
+kb_connect() {
+  local mac i
+  mac=$(kb_mac)
+  [[ -n $mac ]] || die "keyboard is not paired over Bluetooth yet (see README: Pairing)"
+  bluetoothctl power on >/dev/null 2>&1
+  for i in $(seq 1 15); do
+    kb_docked && return 0
+    bluetoothctl info "$mac" 2>/dev/null | grep -q "Connected: yes" && return 0
+    bluetoothctl connect "$mac" >/dev/null 2>&1
+    sleep 2
+  done
+  return 1
+}
+
+# ---------- displays ----------
+monitors_json() { hyprctl monitors all -j 2>/dev/null || echo '[]'; }
+
+# Backlight device for a connector, e.g. eDP-2 -> card1-eDP-2-backlight.
+backlight_for() {
+  local b dev
+  for b in /sys/class/backlight/*; do
+    dev=$(basename "$(readlink -f "$b/device")")
+    [[ $dev == card*-"$1" ]] && { basename "$b"; return 0; }
+  done
+  return 1
+}
+
+bl_get() { brightnessctl -d "$1" -m 2>/dev/null | cut -d, -f4 | tr -d %; }
+
+bl_set() { # bl_set <device> <step>
+  local cur new n
+  cur=$(bl_get "$1") || return 1
+  case $2 in
+    +*%) n=${2//[+%]/}; new=$((cur + n)) ;;
+    *%-) n=${2//[-%]/}; new=$((cur - n)) ;;
+    *%) new=${2%\%} ;;
+    *) die "bad brightness step: $2" ;;
+  esac
+  ((new > 100)) && new=100
+  ((new < 1)) && new=1
+  brightnessctl -d "$1" set "${new}%" >/dev/null
+  echo "$new"
+}
+
+# Monitors are keyed like Hyprland rules: built-in screens by connector name,
+# external monitors by "desc:<make model serial>", so each physical monitor
+# keeps its own spot no matter which port it is plugged into.
+JQ_KEY='def key: if (.name | test("^(eDP|LVDS|DSI)-")) then .name else "desc:" + .description end;'
+
+saved_positions() { # JSON object key -> [x, y]
+  if [[ -s $POSITIONS ]] && jq -e 'type == "object"' "$POSITIONS" >/dev/null 2>&1; then
+    cat "$POSITIONS"
+  else
+    echo '{}'
+  fi
+}
+
+# Desired positions for the current layout, as a JSON object key -> [x, y].
+# Every connected monitor gets an explicit, non-overlapping spot:
+#  - presets place the two built-in screens, then external monitors on the side
+#    chosen with `zenbook-duo external above|below|left|right` (centred or
+#    top-aligned against the laptop block, several in a row);
+#  - the custom layout uses saved spots, and lines up monitors it has not seen
+#    yet to the right.
+# The result is shifted so the top-left corner is 0,0.
+positions() {
+  local json=$1 layout
+  layout=$(setting layout stacked)
+  jq -c --arg layout "$layout" --arg side "$(setting external right)" \
+    --arg t "$TOP" --arg b "$BOTTOM" --argjson saved "$(saved_positions)" "$JQ_KEY"'
+    def size: { w: ((if (.transform % 2) == 1 then .height else .width end) / .scale | floor),
+                h: ((if (.transform % 2) == 1 then .width else .height end) / .scale | floor) };
+    [ .[] | { k: key, internal: (.name | test("^(eDP|LVDS|DSI)-")) } + size ] as $m
+    | ($m | map({ (.k): . }) | add // {}) as $sz
+    | def bbox: [ to_entries[] | select($sz[.key]) | { x: .value[0], y: .value[1], w: $sz[.key].w, h: $sz[.key].h } ]
+        | if length == 0 then { x0: 0, y0: 0, x1: 0, y1: 0 }
+          else { x0: (map(.x) | min), y0: (map(.y) | min), x1: (map(.x + .w) | max), y1: (map(.y + .h) | max) } end;
+      def place($k; $side):
+        bbox as $bb | ($sz[$k] // { w: 0, h: 0 }) as $e
+        | if $side == "above" then . + { ($k): [ ((($bb.x0 + $bb.x1) - $e.w) / 2 | floor), $bb.y0 - $e.h ] }
+          elif $side == "below" then . + { ($k): [ ((($bb.x0 + $bb.x1) - $e.w) / 2 | floor), $bb.y1 ] }
+          elif $side == "left" then . + { ($k): [ $bb.x0 - $e.w, $bb.y0 ] }
+          else . + { ($k): [ $bb.x1, $bb.y0 ] } end;
+      def normalize:
+        ([ to_entries[] | select($sz[.key]) | .value ]) as $v
+        | if ($v | length) == 0 then . else
+            ($v | map(.[0]) | min) as $mx | ($v | map(.[1]) | min) as $my
+            | map_values([ .[0] - $mx, .[1] - $my ]) end;
+
+    ( if $layout == "custom" then $saved
+      else
+        ($sz[$t] // { w: 0, h: 0 }) as $top
+        | if $layout == "side" then { ($t): [0, 0], ($b): [ $top.w, 0 ] }
+          else { ($t): [0, 0], ($b): [ 0, $top.h ] } end
+      end ) as $base
+    | ( if $layout == "custom" then "right" else $side end ) as $dir
+    | reduce ($m[] | select($base[.k] == null) | .k) as $k ($base; place($k; $dir))
+    | normalize
+    # Presets also refresh rules for saved monitors that are unplugged right now,
+    # so a monitor plugged in later lands on the chosen side.
+    | if $layout == "custom" then . else
+        . as $cur
+        | reduce ($saved | keys[] | select(startswith("desc:") and ($cur[.] == null))) as $k (.;
+            . + { ($k): (if $dir == "above" then [0, ([ $cur[] | .[1] ] | min) - 1080]
+                         elif $dir == "left" then [ ([ $cur[] | .[0] ] | min) - 1920, 0 ]
+                         else ( . as $c | [ $c | to_entries[] | select($sz[.key]) | .value[0] + $sz[.key].w ] | max // 0 ) as $r | [ $r, 0 ] end) })
+      end' <<<"$json"
+}
+
+# Write the desired monitor rules to a Lua file that Hyprland loads on every
+# (re)load, then apply them live. Keeps `hyprctl reload` from undoing state, and
+# because the rules stay registered, a known monitor lands in its saved spot
+# the moment it is plugged in.
+apply() {
+  local json layout bottom_on pos
+  json=$(monitors_json)
+  layout=$(setting layout stacked)
+
+  bottom_on=1
+  [[ $(setting bottom on) == off ]] && bottom_on=0
+  [[ $layout == top-only ]] && bottom_on=0
+  [[ $(setting auto on) == on ]] && kb_docked && bottom_on=0
+
+  pos=$(positions "$json")
+
+  {
+    echo "-- Generated by zenbook-duo. Do not edit; run \`zenbook-duo\` instead."
+    jq -r --arg b "$BOTTOM" --argjson on "$bottom_on" '
+      to_entries[] |
+      if .key == $b and $on == 0 then
+        "hl.monitor({ output = \(.key | tojson), disabled = true })"
+      else
+        "hl.monitor({ output = \(.key | tojson), mode = \"preferred\", position = \"\(.value[0])x\(.value[1])\", scale = \"auto\", disabled = false })"
+      end' <<<"$pos"
+  } >"$MONITORS_LUA.tmp" && mv "$MONITORS_LUA.tmp" "$MONITORS_LUA"
+
+  # Only touch Hyprland when a connected monitor differs, to avoid modesets.
+  jq -e --argjson pos "$pos" --arg b "$BOTTOM" --argjson on "$bottom_on" "$JQ_KEY"'
+    any(.[]; key as $k | $pos[$k] as $p | $p != null and (
+      if .name == $b and $on == 0 then .disabled != true
+      else .disabled != false or .x != $p[0] or .y != $p[1] end))' <<<"$json" >/dev/null || return 0
+
+  while IFS= read -r line; do
+    [[ $line == hl.monitor* ]] && hyprctl eval "$line" >/dev/null
+  done <"$MONITORS_LUA"
+}
+
+# Move one monitor to logical position X,Y and save the whole arrangement.
+cmd_arrange() {
+  local target=$1 x=$2 y=$3 json new
+  [[ $x =~ ^-?[0-9]+$ && $y =~ ^-?[0-9]+$ ]] || die "usage: zenbook-duo arrange <monitor> <x> <y>"
+  json=$(monitors_json)
+  jq -e --arg m "$target" 'any(.[]; .name == $m)' <<<"$json" >/dev/null || die "no monitor named $target"
+  # Saved spots of monitors not plugged in now are kept. Connected monitors take
+  # their current positions (a disabled bottom screen keeps its configured spot),
+  # then the moved one, then everything shifts so the top-left is 0,0.
+  new=$(jq -c --argjson saved "$(saved_positions)" --argjson cur "$(positions "$json")" \
+    --arg t "$target" --argjson x "$x" --argjson y "$y" "$JQ_KEY"'
+    ($saved + $cur
+      + ([.[] | select(.disabled == false) | {(key): [.x, .y]}] | add // {})
+      + ([.[] | select(.name == $t) | {(key): [$x, $y]}] | add)) as $all
+    | ([.[] | key] ) as $present
+    | ([$all | to_entries[] | select(.key as $k | $present | index($k)) | .value]) as $vals
+    | ($vals | map(.[0]) | min) as $mx | ($vals | map(.[1]) | min) as $my
+    | $all | map_values([.[0] - $mx, .[1] - $my])' <<<"$json") || die "could not compute arrangement"
+  # Refuse arrangements where connected screens would overlap.
+  jq -e --argjson pos "$new" --arg b "$BOTTOM" "$JQ_KEY"'
+    [ .[] | select(.disabled == false or .name == $b) | key as $k | select($pos[$k]) | {
+        x: $pos[$k][0], y: $pos[$k][1],
+        w: ((if (.transform % 2) == 1 then .height else .width end) / .scale | floor),
+        h: ((if (.transform % 2) == 1 then .width else .height end) / .scale | floor) } ] as $r
+    | any(range(0; $r | length) as $i | range($i + 1; $r | length) as $j | $r[$i] as $a | $r[$j] as $c
+        | $a.x < $c.x + $c.w and $a.x + $a.w > $c.x and $a.y < $c.y + $c.h and $a.y + $a.h > $c.y)' \
+    <<<"$json" >/dev/null && die "screens would overlap at that position"
+  printf '%s\n' "$new" >"$POSITIONS.tmp" && mv "$POSITIONS.tmp" "$POSITIONS"
+  set_setting layout custom
+  apply
+}
+
+# ---------- commands ----------
+cmd_brightness() {
+  local target="" both=0 osd=1 step=get dev p
+  while (($#)); do
+    case $1 in
+      --monitor) target=${2:-}; shift 2 ;;
+      --both) both=1; shift ;;
+      --no-osd) osd=0; shift ;;
+      *) step=$1; shift ;;
+    esac
+  done
+  [[ $(setting link off) == on && -z $target ]] && both=1
+  [[ -n $target ]] || target=$(hyprctl monitors -j | jq -r '.[] | select(.focused) | .name')
+
+  if ((both)) && [[ $step != get ]]; then
+    p=$(bl_set "$(backlight_for "$TOP")" "$step")
+    dev=$(backlight_for "$BOTTOM") && bl_set "$dev" "${p}%" >/dev/null
+    ((osd)) && omarchy-osd -i brightness -p "$p" 2>/dev/null
+    return 0
+  fi
+
+  if ! dev=$(backlight_for "$target"); then
+    # External monitor: hand off to Omarchy's DDC-aware handler.
+    local args=(--monitor "$target")
+    ((osd)) || args=(--no-osd "${args[@]}")
+    [[ $step == get ]] && exec omarchy-brightness-display --monitor "$target"
+    exec omarchy-brightness-display "${args[@]}" "$step"
+  fi
+
+  if [[ $step == get ]]; then
+    bl_get "$dev"
+  else
+    p=$(bl_set "$dev" "$step")
+    ((osd)) && omarchy-osd -i brightness -p "$p" 2>/dev/null
+  fi
+  return 0
+}
+
+cmd_state() {
+  local json mac info connected=false paired=false battery=null top_b bottom_b dev
+  json=$(monitors_json)
+  mac=$(kb_mac)
+  if [[ -n $mac ]]; then
+    paired=true
+    info=$(bluetoothctl info "$mac" 2>/dev/null)
+    grep -q "Connected: yes" <<<"$info" && connected=true
+    battery=$(sed -n 's/.*Battery Percentage: .*(\([0-9]*\)).*/\1/p' <<<"$info")
+    battery=${battery:-null}
+  fi
+  dev=$(backlight_for "$TOP") && top_b=$(bl_get "$dev") || top_b=null
+  dev=$(backlight_for "$BOTTOM") && bottom_b=$(bl_get "$dev") || bottom_b=null
+  kb_docked && docked=true || docked=false
+
+  jq -n -c \
+    --argjson mons "$json" --arg top "$TOP" --arg bottom "$BOTTOM" \
+    --argjson tb "${top_b:-null}" --argjson bb "${bottom_b:-null}" \
+    --argjson docked "$docked" --argjson paired "$paired" --argjson connected "$connected" \
+    --argjson battery "$battery" \
+    --arg auto "$(setting auto on)" --arg link "$(setting link off)" \
+    --arg layout "$(setting layout stacked)" --arg external "$(setting external right)" --arg bottomSetting "$(setting bottom on)" '
+    def mon($n): ($mons | map(select(.name == $n))[0]);
+    {
+      top: { name: $top, brightness: $tb, enabled: (mon($top) != null and mon($top).disabled == false) },
+      bottom: { name: $bottom, brightness: $bb, present: (mon($bottom) != null),
+                enabled: (mon($bottom) != null and mon($bottom).disabled == false), setting: $bottomSetting },
+      focused: ($mons | map(select(.focused))[0].name // ""),
+      monitors: [ $mons[] | {
+        name, x, y, enabled: (.disabled == false), internal: (.name | test("^(eDP|LVDS|DSI)-")),
+        w: ((if (.transform % 2) == 1 then .height else .width end) / .scale | floor),
+        h: ((if (.transform % 2) == 1 then .width else .height end) / .scale | floor)
+      } ],
+      auto: ($auto == "on"), link: ($link == "on"), layout: $layout, external: $external,
+      keyboard: { docked: $docked, paired: $paired, connected: $connected, battery: $battery }
+    }'
+}
+
+cmd_watch() {
+  local lock="${XDG_RUNTIME_DIR:-/tmp}/zenbook-duo-watch.lock" last="" now
+  exec {fd}>"$lock"
+  flock -n "$fd" || die "watcher already running"
+
+  apply
+  kb_docked && last=docked || last=undocked
+
+  # Monitor hotplug: re-apply so every screen gets its spot.
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$UID}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket2.sock"
+  if [[ -S $sock ]] && command -v socat >/dev/null; then
+    socat -u "UNIX-CONNECT:$sock" - 2>/dev/null | while read -r ev; do
+      case $ev in
+        monitoraddedv2*|monitorremovedv2*) sleep 1; apply ;;
+      esac
+    done &
+  fi
+
+  udevadm monitor --udev --subsystem-match=usb 2>/dev/null | while read -r line; do
+    [[ $line == UDEV* ]] || continue
+    sleep 0.5
+    kb_docked && now=docked || now=undocked
+    [[ $now == "$last" ]] && continue
+    last=$now
+    apply
+    [[ $now == undocked ]] && kb_connect >/dev/null 2>&1 &
+  done
+}
+
+case ${1:-} in
+  state) cmd_state ;;
+  brightness) shift; cmd_brightness "$@" ;;
+  bottom)
+    onoff bottom on "${2:-toggle}"
+    # Asking for the bottom screen explicitly overrides what would keep it off.
+    if [[ $(setting bottom on) == on ]]; then
+      [[ $(setting layout stacked) == top-only ]] && set_setting layout stacked
+      [[ $(setting auto on) == on ]] && kb_docked && set_setting auto off
+    fi
+    apply
+    ;;
+  auto) onoff auto on "${2:-toggle}"; apply ;;
+  link) onoff link off "${2:-toggle}" ;;
+  external)
+    case ${2:-} in above | below | left | right) set_setting external "$2" ;; *) die "external: above, below, left or right" ;; esac
+    apply
+    ;;
+  layout)
+    case ${2:-} in
+      stacked | side | top-only) set_setting layout "$2" ;;
+      next)
+        case $(setting layout stacked) in stacked) set_setting layout side ;; side) set_setting layout top-only ;; *) set_setting layout stacked ;; esac
+        ;;
+      *) die "layout: stacked, side, top-only or next" ;;
+    esac
+    apply
+    ;;
+  keyboard)
+    case ${2:-} in
+      connect) kb_connect ;;
+      pair) kb_pair ;;
+      *) die "usage: zenbook-duo keyboard connect|pair" ;;
+    esac
+    ;;
+  swap) hyprctl dispatch "hl.dsp.workspace.swap_monitors({ monitor1 = \"$TOP\", monitor2 = \"$BOTTOM\" })" >/dev/null ;;
+  kbd-light)
+    case ${2:-cycle} in 0 | 1 | 2 | 3 | cycle | up | down) ;; *) die "kbd-light: 0-3, up, down or cycle" ;; esac
+    [[ -d /run/zenbook-duo ]] || die "zenbook-duo-keys service is not running"
+    printf '%s\n' "${2:-cycle}" >/run/zenbook-duo/kbd-backlight
+    ;;
+  arrange) shift; cmd_arrange "${1:-}" "${2:-}" "${3:-}" ;;
+  apply) apply ;;
+  watch) cmd_watch ;;
+  -h | --help | help | "") sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac

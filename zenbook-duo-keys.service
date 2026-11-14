@@ -1,0 +1,11 @@
+[Unit]
+Description=ASUS Zenbook Duo keyboard Fn keys and backlight
+After=bluetooth.service
+
+[Service]
+ExecStart=/usr/local/lib/zenbook-duo/zenbook-duo-keys
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

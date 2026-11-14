@@ -1,0 +1,233 @@
+#!/usr/bin/python3 -I
+"""zenbook-duo-keys: make the Zenbook Duo keyboard's ASUS Fn keys work.
+
+The kernel's hid-asus driver does not know the 2025 Duo keyboard (0b05:1bf2 USB,
+0b05:1bf3 Bluetooth), so hid-generic ignores its vendor report (ID 0x5a, usage
+page 0xff31). This daemon reads that report from hidraw, re-emits standard keys
+through a virtual uinput keyboard (so Hyprland bindings handle them), and drives
+the keyboard backlight itself.
+
+Runs as root (hidraw + uinput) from zenbook-duo-keys.service.
+"""
+
+import fcntl
+import glob
+import os
+import re
+import select
+import struct
+import sys
+import time
+
+KEYBOARD_IDS = re.compile(r"0B05:(1BF2|1BF3|1B2C)\.", re.I)  # 2025 USB/BT, 2024 USB
+STATE_DIR = "/var/lib/zenbook-duo"
+LEVEL_FILE = os.path.join(STATE_DIR, "kbd-backlight")
+REQUEST_DIR = "/run/zenbook-duo"
+REQUEST_FILE = os.path.join(REQUEST_DIR, "kbd-backlight")  # user-writable: "0".."3", "cycle"
+
+EV_SYN, EV_KEY = 0x00, 0x01
+KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP = 224, 225
+KEY_MICMUTE = 248
+KEY_PROG1, KEY_PROG2, KEY_PROG3, KEY_PROG4 = 148, 149, 202, 203  # XF86Launch1..4
+
+KBD_BACKLIGHT_CYCLE = 0xC7  # F4
+FN_LOCK = 0x4E              # Fn+Esc
+FNLOCK_FILE = os.path.join(STATE_DIR, "fn-lock")
+# Vendor code -> key emitted. PROG keys arrive in Hyprland as XF86Launch1..4 and
+# are bound in hypr/zenbook-duo.lua. F1-F3 are standard consumer keys, F7 sends
+# Super+P and F10 is the keyboard's own Bluetooth pairing key (nothing reaches the host).
+KEYMAP = {
+    0x10: KEY_BRIGHTNESSDOWN,  # F5
+    0x20: KEY_BRIGHTNESSUP,    # F6
+    0x9C: KEY_PROG1,           # F8  swap windows between screens
+    0x7C: KEY_MICMUTE,         # F9
+    0x7E: KEY_PROG2,           # F11 emoji
+    0x86: KEY_PROG3,           # F12 MyASUS
+    0x6A: KEY_PROG4,           # key right of F12: lower screen on/off
+}
+IGNORED = {0x3D}  # unsolicited report the keyboard sends by itself
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+# ---------- uinput ----------
+def _IOW(t, nr, size):
+    return (1 << 30) | (size << 16) | (ord(t) << 8) | nr
+
+
+UI_SET_EVBIT = _IOW("U", 100, 4)
+UI_SET_KEYBIT = _IOW("U", 101, 4)
+UI_DEV_SETUP = _IOW("U", 3, 92)
+UI_DEV_CREATE = (ord("U") << 8) | 1
+
+
+class VirtualKeyboard:
+    def __init__(self, keys):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        for k in keys:
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, k)
+        name = b"Zenbook Duo Fn keys"
+        setup = struct.pack("HHHH80sI", 0x06, 0x0B05, 0x1BF0, 1, name, 0)  # BUS_VIRTUAL
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+
+    def _emit(self, typ, code, value):
+        os.write(self.fd, struct.pack("llHHi", 0, 0, typ, code, value))
+
+    def tap(self, key):
+        self._emit(EV_KEY, key, 1)
+        self._emit(EV_SYN, 0, 0)
+        self._emit(EV_KEY, key, 0)
+        self._emit(EV_SYN, 0, 0)
+
+
+# ---------- hidraw ----------
+def HIDIOCSFEATURE(n):
+    return (3 << 30) | (n << 16) | (ord("H") << 8) | 0x06
+
+
+def has_vendor_report(hidraw):
+    """True if this hidraw node carries report ID 0x5a on usage page 0xff31."""
+    try:
+        desc = open(f"/sys/class/hidraw/{hidraw}/device/report_descriptor", "rb").read()
+    except OSError:
+        return False
+    return b"\x06\x31\xff" in desc and b"\x85\x5a" in desc
+
+
+def find_nodes():
+    nodes = []
+    for path in glob.glob("/sys/class/hidraw/hidraw*"):
+        name = os.path.basename(path)
+        if KEYBOARD_IDS.search(os.path.realpath(path + "/device")) and has_vendor_report(name):
+            nodes.append("/dev/" + name)
+    return sorted(nodes)
+
+
+def read_int(path, default, lo, hi):
+    try:
+        return max(lo, min(hi, int(open(path).read().strip())))
+    except (OSError, ValueError):
+        return default
+
+
+def write_int(path, value):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(f"{value}\n")
+
+
+def send_feature(fd, payload):
+    # Must be exactly 16 bytes (report ID + 15): over Bluetooth the keyboard
+    # ignores shorter reports.
+    buf = bytearray(payload) + bytes(16 - len(payload))
+    fcntl.ioctl(fd, HIDIOCSFEATURE(len(buf)), buf)
+
+
+def set_backlight(fd, level):
+    send_feature(fd, [0x5A, 0xBA, 0xC5, 0xC4, level])
+
+
+def set_fn_lock(fd, on):
+    # 0: top row sends media/hotkeys, 1: top row sends F1-F12.
+    send_feature(fd, [0x5A, 0xD0, 0x4E, 1 if on else 0])
+
+
+def main():
+    kbd = VirtualKeyboard(set(KEYMAP.values()))
+    os.makedirs(REQUEST_DIR, exist_ok=True)
+    os.chmod(REQUEST_DIR, 0o1777)
+    open_fds = {}  # path -> fd
+    level = read_int(LEVEL_FILE, 1, 0, 3)
+    fn_lock = read_int(FNLOCK_FILE, 0, 0, 1)
+    last_scan = 0.0
+
+    def apply(setter, value):
+        for p, fd in list(open_fds.items()):
+            try:
+                setter(fd, value)
+            except OSError as e:
+                log(f"{setter.__name__} on {p} failed: {e}")
+
+    def apply_level(lvl):
+        apply(set_backlight, lvl)
+
+    while True:
+        now = time.monotonic()
+        if now - last_scan > 2:
+            last_scan = now
+            wanted = find_nodes()
+            for p in list(open_fds):
+                if p not in wanted:
+                    os.close(open_fds.pop(p))
+            for p in wanted:
+                if p not in open_fds:
+                    try:
+                        open_fds[p] = os.open(p, os.O_RDWR | os.O_NONBLOCK)
+                        log(f"listening on {p}")
+                        # The keyboard forgets both on every dock/undock/reconnect.
+                        set_backlight(open_fds[p], level)
+                        set_fn_lock(open_fds[p], fn_lock)
+                    except OSError as e:
+                        log(f"cannot open {p}: {e}")
+
+        # Requests from the user session (zenbook-duo kbd-light ...).
+        try:
+            rfd = os.open(REQUEST_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            req = os.read(rfd, 16).decode(errors="ignore").strip()
+            os.close(rfd)
+            os.unlink(REQUEST_FILE)
+            if req == "cycle":
+                level = (level + 1) % 4
+            elif req == "up":
+                level = min(3, level + 1)
+            elif req == "down":
+                level = max(0, level - 1)
+            elif req in ("0", "1", "2", "3"):
+                level = int(req)
+            write_int(LEVEL_FILE, level)
+            apply_level(level)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f"request failed: {e}")
+
+        fds = list(open_fds.values())
+        if not fds:
+            time.sleep(0.5)
+            continue
+        ready, _, _ = select.select(fds, [], [], 0.5)
+        for fd in ready:
+            try:
+                data = os.read(fd, 64)
+            except OSError:
+                for p, f in list(open_fds.items()):
+                    if f == fd:
+                        os.close(open_fds.pop(p))
+                continue
+            if len(data) < 2 or data[0] != 0x5A or data[1] == 0:
+                continue
+            code = data[1]
+            if code == KBD_BACKLIGHT_CYCLE:
+                level = (level + 1) % 4
+                write_int(LEVEL_FILE, level)
+                apply_level(level)
+            elif code == FN_LOCK:
+                # Once the host has sent any command the keyboard stops toggling
+                # Fn-lock itself, so do it here.
+                fn_lock ^= 1
+                write_int(FNLOCK_FILE, fn_lock)
+                apply(set_fn_lock, fn_lock)
+            elif code in KEYMAP:
+                kbd.tap(KEYMAP[code])
+            elif code in IGNORED:
+                pass
+            else:
+                log(f"unmapped vendor key 0x{code:02x}")
+
+
+if __name__ == "__main__":
+    main()

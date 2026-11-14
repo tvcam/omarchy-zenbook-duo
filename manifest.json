@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "zenbook-duo",
+  "name": "Zenbook Duo",
+  "version": "0.1.0",
+  "author": "omarchy-zenbook-duo contributors",
+  "description": "ASUS Zenbook Duo dual-screen controls: per-screen brightness, bottom screen, layouts and keyboard status",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Zenbook Duo",
+    "description": "Per-screen brightness, bottom screen, layouts and keyboard status",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

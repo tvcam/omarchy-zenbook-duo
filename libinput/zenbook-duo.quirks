@@ -1,0 +1,6 @@
+# ASUS Zenbook Duo detachable keyboard: libinput treats its touchpad as an
+# external device, which disables palm rejection while typing. Declare that the
+# touchpad sits below the keys like a built-in one.
+[ASUS Zenbook Duo Keyboard Touchpad]
+MatchName=*ASUS Zenbook Duo Keyboard Touchpad
+AttrTPKComboLayout=below
