@@ -80,6 +80,7 @@ zenbook-duo auto on|off|toggle                     bottom screen off while docke
 zenbook-duo link on|off|toggle                     move both screens' brightness together
 zenbook-duo layout stacked|side|top-only|next
 zenbook-duo external above|below|left|right        where external monitors go in the presets
+zenbook-duo refresh 60|120|max                     built-in screens' refresh rate (60 runs cooler)
 zenbook-duo arrange <monitor> <x> <y>              move a screen (logical px), saved per monitor
 zenbook-duo swap
 zenbook-duo cycle [next|prev]
@@ -93,6 +94,7 @@ zenbook-duo apply | watch
 - **Dock detection.** When the keyboard sits on the bottom screen it connects over USB through pogo pins. `zenbook-duo watch` follows USB add and remove events through `udevadm monitor`.
 - **Saved screen layout.** The desired monitor rules are written to `~/.local/state/zenbook-duo/monitors.lua`, which `zenbook-duo.lua` loads on every config load. Running `hyprctl reload` therefore keeps the current state instead of turning the bottom screen back on.
 - **Screen arrangement.** Positions are saved in `~/.local/state/zenbook-duo/positions`. Built-in screens are keyed by connector (`eDP-1`) and external monitors by `desc:<make model serial>`, the same matching Hyprland's own monitor rules use. Saved monitors that aren't plugged in keep their rules, so Hyprland moves a known monitor into place the moment it's connected. Arrangements that would make screens overlap are refused.
+- **Refresh rate.** `zenbook-duo refresh 60` runs both built-in screens at their largest 60 Hz mode, which means less drawing work, heat and battery use. `max` (the default) uses the panel's preferred mode, 120 Hz on the UX8406. External monitors always use their preferred mode. The choice is saved and written into the same monitor rules, so it survives dock changes and `hyprctl reload`.
 - **Brightness.** Each built-in screen has its own backlight device, such as `intel_backlight` → `eDP-1` and `card1-eDP-2-backlight` → `eDP-2`. The device for each screen is found from `/sys/class/backlight/*/device`. External monitors are passed to `omarchy-brightness-display`.
 - **Fn keys.** The kernel's `hid-asus` driver doesn't list the 2025 keyboard, so its ASUS vendor report (ID `0x5a`, usage page `0xff31`) is ignored. `zenbook-duo-keys` reads that report from hidraw and sends standard keys through a virtual uinput keyboard called *Zenbook Duo Fn keys*. It sets the backlight with the feature report `5a ba c5 c4 <0-3>`.
 
